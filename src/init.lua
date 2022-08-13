@@ -56,14 +56,11 @@
 	that it will index your values by Name (will use row number if no Name prop exists), as it is much
 	easier to for you to work with.
 
-	SheetValues will attempt to convert the string in each cell into your intended datatype, using familiar Lua syntax.
-	Numbers and booleans are written plainly, strings are wrapped in quotes, and tables are wrapped in {}.
-	Special Roblox types are written as Type.new(...), to align with their Luau counterparts.
-	It will default back to string if it cannot figure out a type, but it is recommended to explicilty write
-	your strings in "quotes" to avoid relying on this.
+	If you have a boolean or number entered, it will attempt to convert the string into your intended datatype.
+	To create special types, you can explicitly mark them by having the property be "Type(val)", like "Vector3(1,0,3)"
 
-	Supported property Types:
-	- string
+	Supported explicit property Types (not case sensitive):
+	- string (for ensuring a number/boolean remains a string)
 	- array
 	- dictionary
 	- Vector3
@@ -79,13 +76,13 @@
 
 	Sample Sheet:
 
-	Name                Prop                                              SecondaryProp               AnyPropNameYouLike        [Recommend that you freeze Row 1]
-	BoostDirection      Vector3.new(10, 2, 6.2)                           100                         10000
-	SpeedMultiplier     0.3 [will autodetect and convert to number]       1                           FALSE
-	DebugEnabled        TRUE [will autodetect and convert to boolean]     "JSONstring"                "you get the point"
-	DontAutodetect      "TRUE" [will NOT convert to boolean]       	      TRUE                        "you can add as many columns as you need"
-	ArrayOfNumbers      {1, 2, 3}                                         Vector2.new(5,2)            "and easily set the value type"
-	DictOfStrings       {Foo = "hello", Bar = "world"}                    UDim2.new(0.3,-10,0,350)    "it's great!"
+	Name                Prop                                              SecondaryProp           AnyPropNameYouLike        [Recommend that you freeze Row 1]
+	BoostDirection      Vector3(10, 2, 6.2)                               100                     10000
+	SpeedMultiplier     0.3 [will autodetect and convert to number]       1                       FALSE
+	DebugEnabled        TRUE [will autodetect and convert to boolean]     JSONstring              you get the point
+	DontAutodetect      string(TRUE) [will NOT convert to boolean]        TRUE                    you can add as many columns as you need
+	ArrayOfStrings      array(firstIndex,secondIndex,thirdIndex)          Vector2(5,2)            and easily set the value type
+	DictOfKeyedStrings  dictionary(key1=stringvalue,key2=anotherstring)   UDim2(0.3,-10,0,350)    it's great!
 
 	API:
 	-------
@@ -159,61 +156,32 @@ local UPDATE_RATE = 30 -- every X seconds
 
 local HttpService = game:GetService("HttpService")
 local DatastoreService = game:GetService("DataStoreService")
-local MessagingService = game:GetService("MessagingService")
+local SheetDataStore = DatastoreService:GetDataStore("SheetValuesV2")
 
 local SHA1 = require(script.SHA1)
 local TypeTransformer = require(script.TypeTransformer)
 
 local function ConvertTyped(Input)
-	if type(Input) ~= "string" then
-		-- Already typed
-		return Input
-	end
-
 	local lowerInput = string.lower(Input)
 
-	-- Check if explicitly string
-	if string.match(lowerInput, "^[\"']") and string.match(lowerInput, "[\"']$") then
-		return string.sub(Input, 2, #Input - 1)
+	-- Check if it's explicitly a string first
+	if string.match(lowerInput, "^string%(") then
+		return string.sub(Input, 8, #Input - 1)
 	end
 
-	-- Check if boolean
+	-- Check for boolean input
 	if lowerInput == "true" or lowerInput == "false" then
 		return lowerInput == "true"
 	end
 
-	-- Check if number
+	-- Check for number input
 	local n = tonumber(Input)
 	if tostring(n) == Input then
 		return n
 	end
 
-	-- Check if table
-	if string.match(lowerInput, "^{") and string.match(lowerInput, "}$") then
-		local output = {}
-
-		-- TODO: Instead of splitting by commas, parse it yourself so that Vector3(1,1,1) doesn't cause 2 incorrect splits
-		local keyvalues = string.split(string.sub(Input, 2, #Input - 1), ",")
-		for i, keyvalue in ipairs(keyvalues) do
-			-- Remove leading whitespace
-			keyvalue = string.gsub(keyvalue, "^ ", "")
-
-			-- Check if dictionary
-			local key, value = string.match(keyvalue, "(%w+)%s*=%s*(.+)")
-			if key and value then
-				output[key] = ConvertTyped(value)
-				continue
-			end
-
-			-- Default to array
-			output[i] = ConvertTyped(keyvalue)
-		end
-
-		return output
-	end
-
-	-- Check if explicitly typed (ex: "Vector3.new(1,1,1)", "UDim2.new(0,100,0,80)")
-	local Type, Value = string.match(Input, "^(%w+)%.?[new]*%((.-)%)$")
+	-- Check for explicitly typed (ex: "Vector3(1,1,1)", "UDim2(0,100,0,80)")
+	local Type, Value = string.match(Input, "^(%w+)%((.-)%)$")
 	if Type and Value then
 		local Transformer = TypeTransformer[string.lower(Type)]
 		if Transformer then
@@ -221,7 +189,6 @@ local function ConvertTyped(Input)
 		end
 	end
 
-	-- Fallback to string
 	return Input
 end
 
@@ -253,11 +220,11 @@ end
 
 local SheetValues = {}
 
-function SheetValues.new(SpreadId: string, SheetId: string?)
+function SheetValues.new(SpreadId: string, sheetId: string?)
 	assert(type(SpreadId) == "string", "Invalid SpreadId")
 
 	-- Default SheetId to 0 as that's Google's default SheetId
-	SheetId = (SheetId or "0")
+	local SheetId = (sheetId or "0")
 
 	local GUID = SHA1(SpreadId .. "||" .. SheetId)
 
@@ -266,16 +233,13 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 	local SheetManager = {
 		Changed = ChangedEvent.Event,
 
-		LastUpdated = 0,
-		LastSource = "",
 		Values = {},
 
 		_ValueChangeEvents = {},
-		_DataStore = DatastoreService:GetDataStore(GUID, "SheetValues"),
 		_Alive = true,
 	}
 
-	function SheetManager:_setValues(json: string, timestamp: number)
+	function SheetManager:_setValues(json: string)
 		local decodeSuccess, sheet = pcall(HttpService.JSONDecode, HttpService, json)
 		if not decodeSuccess then
 			return
@@ -285,8 +249,6 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 		end
 
 		--print("Time:", timestamp, "\nJSON:", sheet)
-
-		self.LastUpdated = timestamp or self.LastUpdated
 
 		local isChanged = false
 
@@ -299,7 +261,7 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 					continue
 				end
 
-				Value[key] = ConvertTyped(if Comp.v ~= nil then Comp.v else "")
+				Value[key] = ConvertTyped(Comp.v)
 			end
 
 			local Name = Value.Name or Value.name or string.format("%d", Row) -- Index by name, or by row if no names exist
@@ -324,7 +286,7 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 
 	function SheetManager:_getFromHttp()
 		-- Attempt to get values from Google's API
-		local httpSuccess, httpResponse = pcall(HttpService.RequestAsync, HttpService, {
+		local success, response = pcall(HttpService.RequestAsync, HttpService, {
 			Url = string.format(
 				"https://docs.google.com/spreadsheets/d/%s/gviz/tq?tqx=out:json&headers=1&gid=%s",
 				SpreadId,
@@ -334,88 +296,47 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 			Headers = {},
 		})
 
-		if not httpSuccess then
-			-- Http failure
-			return false, httpResponse
-		end
+		if success then
+			-- http request went through, decode and handle it
+			if response.Success then
+				-- request success, set these values
 
-		if not httpResponse.Success then
-			-- API failure
-			return false, httpResponse.StatusCode
-		end
+				local now = DateTime.now().UnixTimestamp
+				local json = string.match(response.Body, "{.+}")
 
-		-- Request successful, now set these values
+				self:_setValues(json, now)
 
-		local now = DateTime.now().UnixTimestamp
-		local json = string.match(httpResponse.Body, "{.+}")
+				-- Put these new values into the store
+				pcall(SheetDataStore.SetAsync, SheetDataStore, GUID, json)
+				--if not s then warn(e) end
 
-		self.LastSource = "Google API"
-		self:_setValues(json, now)
-
-		-- Put these new values into the store
-		local datastoreSuccess, datastoreResponse = pcall(
-			self._DataStore.UpdateAsync,
-			self._DataStore,
-			"JSON",
-			function(storeValues)
-				storeValues = storeValues or table.create(2)
-
-				if now <= (storeValues.Timestamp or 0) then
-					-- The store is actually more recent than us, use it instead
-					self.LastSource = "Datastore Override"
-					self:_setValues(storeValues.JSON, storeValues.Timestamp)
-					return storeValues
-				end
-
-				storeValues.Timestamp = now
-				storeValues.JSON = json
-
-				return storeValues
+				return true, "Values updated"
+			else
+				-- API failure
+				return false, response.StatusCode
 			end
-		)
-		--if not datastoreSuccess then warn(datastoreResponse) end
-
-		-- Send these values to all other servers
-		if self.LastSource == "Google API" then
-			local msgSuccess, msgResponse = pcall(
-				MessagingService.PublishAsync,
-				MessagingService,
-				GUID,
-				#json < 1000 and json or "TriggerStore"
-			)
-			--if not msgSuccess then warn(msgResponse) end
+		else
+			-- Http failure
+			return false, response
 		end
-
-		return true, "Values updated"
+		--]=]
 	end
 
 	function SheetManager:_getFromStore()
 		-- Attempt to get values from store
-		local success, response = pcall(self._DataStore.GetAsync, self._DataStore, "JSON")
+		local success, response = pcall(SheetDataStore.GetAsync, SheetDataStore, GUID)
 		if not success then
 			-- Store failure
 			return false, response
 		end
 
 		if not response then
-			return false, "Cache doesn't exist"
+			return false, nil
 		end
 
-		local cacheTimestamp = response.Timestamp or 0
-		local now = DateTime.now().UnixTimestamp
+		self:_setValues(response)
 
-		if now - cacheTimestamp >= UPDATE_RATE then
-			return false, "Cache expired"
-		end
-		if cacheTimestamp <= self.LastUpdated then
-			return true, "Values up to date"
-		end
-
-		-- set these values
-		self.LastSource = "Datastore"
-		self:_setValues(response.JSON, cacheTimestamp)
-
-		return true, "Values updated"
+		return true
 	end
 
 	function SheetManager:UpdateValues()
@@ -423,14 +344,11 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 		local storeSuccess, storeResult = self:_getFromStore()
 		--print(storeSuccess,storeResult)
 
-		-- Get successful, update complete
-		if storeSuccess then
-			return
+		if storeResult == nil then
+			-- This place has not been initialized yet
+			local httpSuccess, httpResult = self:_getFromHttp()
+			--print(httpSuccess,httpResult)
 		end
-
-		-- Store values too old or store failed, get from http and update/share
-		local httpSuccess, httpResult = self:_getFromHttp()
-		--print(httpSuccess,httpResult)
 	end
 
 	function SheetManager:GetValue(Name: string, Default: any)
@@ -448,10 +366,6 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 	end
 
 	function SheetManager:Destroy()
-		if SheetManager._MessageListener then
-			SheetManager._MessageListener:Disconnect()
-		end
-
 		ChangedEvent:Destroy()
 		for _, Event in pairs(self._ValueChangeEvents) do
 			Event:Destroy()
@@ -459,25 +373,6 @@ function SheetValues.new(SpreadId: string, SheetId: string?)
 
 		table.clear(self)
 	end
-
-	pcall(function()
-		SheetManager._MessageListener = MessagingService:SubscribeAsync(GUID, function(Msg)
-			local msgTimestamp = math.floor(Msg.Sent)
-			if msgTimestamp <= SheetManager.LastUpdated then
-				-- Ignore outdated data
-				return
-			end
-
-			local json = Msg.Data
-			if json == "TriggerStore" then
-				-- Datastore was updated with a file too large to send directly, this is a blank trigger
-				local storeSuccess, storeResult = SheetManager:_getFromStore()
-			else
-				SheetManager.LastSource = "MsgService Subscription"
-				SheetManager:_setValues(json, msgTimestamp)
-			end
-		end)
-	end)
 
 	task.defer(function()
 		while SheetManager._Alive do
